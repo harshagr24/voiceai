@@ -1,7 +1,9 @@
 import express from "express";
 import cors from "cors";
-import fetch from "node-fetch";
 import dotenv from "dotenv";
+import mongoose from "mongoose";
+import fetch from "node-fetch";
+import { v4 as uuidv4 } from "uuid";
 
 dotenv.config();
 
@@ -9,57 +11,135 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Debug: check if key loaded
-console.log("Loaded Groq API Key:", process.env.GROQ_API_KEY ? "✅ Found" : "❌ Missing");
+// =========================
+// MongoDB Connection
+// =========================
+mongoose.connect(process.env.MONGO_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+})
+.then(() => console.log("✅ MongoDB Connected"))
+.catch(err => console.error("❌ MongoDB Connection Error:", err));
 
+// =========================
+// Chat Schema
+// =========================
+const chatSchema = new mongoose.Schema({
+  conversationId: String,
+  messages: [
+    {
+      role: String, // "user" or "bot"
+      text: String,
+      timestamp: { type: Date, default: Date.now },
+    },
+  ],
+});
+const Chat = mongoose.model("Chat", chatSchema);
+
+// =========================
+// Routes
+// =========================
+
+// Root route
 app.get("/", (req, res) => {
-  res.send("✅ Voice Bot backend (Groq API) is running!");
+  res.send("✅ AI Voice Bot API is running!");
 });
 
+// POST /api/chat → Send message to Groq, store in DB
 app.post("/api/chat", async (req, res) => {
   try {
-    const { message } = req.body;
+    let { message, conversationId } = req.body;
 
-    if (!message || message.trim() === "") {
-      return res.status(400).json({ reply: "Please say something." });
+    if (!message) {
+      return res.status(400).json({ error: "Message is required" });
     }
 
-    if (!process.env.GROQ_API_KEY) {
-      console.error("❌ Missing Groq API key");
-      return res.status(500).json({ reply: "Missing API key" });
+    if (!conversationId) {
+      conversationId = uuidv4();
     }
 
-    const completion = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: "llama3-70b-8192",
-        messages: [
-          { role: "system", content: "You are a friendly and thoughtful AI assistant. Speak conversationally and clearly." },
-          { role: "user", content: message }
-        ]
-      })
-    });
+    // Call Groq API with supported model
+    const groqResponse = await fetch(
+      "https://api.groq.com/openai/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "llama-3.3-70b-versatile", // ✅ Supported model
+          messages: [
+            { role: "system", content: "You are a helpful AI assistant that answers naturally." },
+            { role: "user", content: message }
+          ],
+          temperature: 0.7,
+        }),
+      }
+    );
 
-    const result = await completion.json();
+    const result = await groqResponse.json();
+    console.log("📌 Groq API Raw Response:", JSON.stringify(result, null, 2));
 
-    // Debug: print raw API result
-    console.log("Groq API Raw Response:", JSON.stringify(result, null, 2));
-
-    if (!result.choices || !result.choices[0].message) {
-      console.error("❌ Groq API Error:", result);
-      return res.status(500).json({ reply: "Error from Groq API." });
+    if (result.error) {
+      console.error("❌ Groq API Error:", result.error);
+      return res.status(500).json({ error: result.error.message });
     }
 
-    res.json({ reply: result.choices[0].message.content });
+    // Handle both OpenAI-style and Groq-style responses
+    const botReply =
+      result?.choices?.[0]?.message?.content?.trim() ||
+      result?.choices?.[0]?.text?.trim() ||
+      "Sorry, I couldn't generate a reply.";
+
+    // Save conversation to DB
+    let chat = await Chat.findOne({ conversationId });
+    if (!chat) {
+      chat = new Chat({ conversationId, messages: [] });
+    }
+    chat.messages.push({ role: "user", text: message });
+    chat.messages.push({ role: "bot", text: botReply });
+    await chat.save();
+
+    res.json({ reply: botReply, conversationId });
 
   } catch (error) {
-    console.error("❌ Server Error:", error);
-    res.status(500).json({ reply: "Internal server error." });
+    console.error("❌ Error in /api/chat:", error);
+    res.status(500).json({ error: "Something went wrong" });
   }
 });
 
-app.listen(3000, () => console.log("✅ Server running on http://localhost:3000"));
+// GET /api/history → List all conversations with first message as title
+app.get("/api/history", async (req, res) => {
+  try {
+    const chats = await Chat.find({}, { conversationId: 1, messages: 1, _id: 0 });
+
+    const history = chats.map(chat => ({
+      conversationId: chat.conversationId,
+      title: chat.messages.find(m => m.role === "user")?.text || "New Conversation"
+    }));
+
+    res.json(history);
+  } catch (error) {
+    console.error("❌ Error fetching history:", error);
+    res.status(500).json({ error: "Error fetching history" });
+  }
+});
+
+// GET /api/history/:id → Get messages from specific conversation
+app.get("/api/history/:id", async (req, res) => {
+  try {
+    const chat = await Chat.findOne({ conversationId: req.params.id });
+    if (!chat) return res.status(404).json({ error: "Conversation not found" });
+    res.json(chat);
+  } catch (error) {
+    console.error("❌ Error fetching conversation:", error);
+    res.status(500).json({ error: "Error fetching conversation" });
+  }
+});
+
+// =========================
+// Start Server
+// =========================
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
